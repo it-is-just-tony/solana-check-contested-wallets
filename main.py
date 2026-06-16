@@ -1,46 +1,63 @@
+import argparse
 import csv
-import sys
 import json
 import random
+import sys
+from pathlib import Path
+from typing import Any
+
 import tls_client
 from fake_useragent import UserAgent
+
+CONFIG_PATH = Path("config.json")
+RESULTS_DIR = Path("results")
+LAMPORTS_PER_SOL = 1_000_000_000
+
 
 def shorten(s: str) -> str:
     return f"{s[:4]}...{s[-5:]}" if len(s) >= 9 else s
 
-def checkTxIsBuy(txData: dict) -> bool:
-    for msg in txData["result"]["meta"].get("logMessages", []):
+
+def checkTxIsBuy(txData: dict[str, Any]) -> bool:
+    """Return True only when transaction logs explicitly identify a buy."""
+    log_messages = txData.get("result", {}).get("meta", {}).get("logMessages", []) or []
+    for msg in log_messages:
         if "Instruction: Sell" in msg:
             return False
         if "Instruction: Buy" in msg:
             return True
-    return True
+    return False
 
-def getFeeInfo(txData: dict):
+
+def getFeeInfo(txData: dict[str, Any]):
     feePaidTo = {}
     feePaid = 0
-    for instr in txData["result"]["transaction"]["message"]["instructions"]:
+    instructions = txData.get("result", {}).get("transaction", {}).get("message", {}).get("instructions", [])
+    for instr in instructions:
         if "parsed" in instr and instr["parsed"].get("type") == "transfer":
             info = instr["parsed"].get("info", {})
             dest = info.get("destination")
             lamports = int(info.get("lamports", 0))
             if dest in feeWallets:
-                solAmount = lamports / 1_000_000_000
+                solAmount = lamports / LAMPORTS_PER_SOL
                 feePaidTo[feeWallets[dest]] = solAmount
                 feePaid += solAmount
     return feePaidTo, feePaid
 
-def getSolAmountBought(txData: dict) -> float:
+
+def getSolAmountBought(txData: dict[str, Any]) -> float:
     solAmount = 0
-    for group in txData["result"]["meta"].get("innerInstructions", []):
+    inner_instructions = txData.get("result", {}).get("meta", {}).get("innerInstructions", []) or []
+    for group in inner_instructions:
         for instr in group.get("instructions", []):
             if instr.get("program") == "system":
                 parsed = instr.get("parsed")
                 if parsed and parsed.get("type") == "transfer":
                     lamports = parsed.get("info", {}).get("lamports")
                     if lamports:
-                        solAmount += lamports / 1e9
+                        solAmount += lamports / LAMPORTS_PER_SOL
     return solAmount
+
 
 botAccounts = {
     "LUNARCc6FmA3hzPrwmXW3z6RNX1MYXhKS4opYoqCm9P": "Lunar",
@@ -120,10 +137,12 @@ feeWallets = {
     "Dz8rMcdokTLfbnNz2ZdYocZixgaA1TMqbA31xtwPgcxb": "0slot"
 }
 
+
 class CopyWalletFinder:
     def __init__(self, rpcUrl: str):
         self.rpcUrl = rpcUrl
         self.session = tls_client.Session(client_identifier="chrome_103")
+        self.headers = {}
 
     def randomiseRequest(self):
         self.identifier = random.choice(
@@ -133,12 +152,8 @@ class CopyWalletFinder:
         parts = self.identifier.split('_')
         identifier, version, *rest = parts
         identifier = identifier.capitalize()
-        
-        self.sendRequest = tls_client.Session(random_tls_extension_order=True, client_identifier=self.identifier)
-        self.sendRequest.timeout_seconds = 60
 
         if identifier == 'Opera':
-            identifier = 'Chrome'
             osType = 'Windows'
         elif version.lower() == 'ios':
             osType = 'iOS'
@@ -151,101 +166,117 @@ class CopyWalletFinder:
             self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:82.0) Gecko/20100101 Firefox/82.0"
 
         self.headers = {
-            'Host': 'gmgn.ai',
             'accept': 'application/json, text/plain, */*',
-            'accept-language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-            'dnt': '1',
-            'priority': 'u=1, i',
+            'accept-language': 'en-US,en;q=0.9',
             'referer': 'https://gmgn.ai/?chain=sol',
-            'user-agent': self.user_agent
+            'user-agent': self.user_agent,
         }
+
+    def _request_json(self, method: str, url: str, **kwargs):
+        try:
+            response = getattr(self.session, method)(url, **kwargs)
+            return response.json()
+        except Exception as exc:
+            print(f"Request failed: {exc}")
+            return None
+
+    def _rpc(self, method: str, params: list[Any]):
+        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        data = self._request_json("post", self.rpcUrl, json=payload)
+        if not data:
+            return None
+        if data.get("error"):
+            print(f"RPC {method} error: {data['error']}")
+            return None
+        if data.get("result") is None:
+            print(f"RPC {method} returned no result")
+            return None
+        return data
 
     def getPNL(self, contractAddress: str, walletAddress: str):
         url = f"https://gmgn.ai/defi/quotation/v1/smartmoney/sol/walletstat/{walletAddress}?token_address={contractAddress}&period=1d"
         for _ in range(3):
             self.randomiseRequest()
+            tokenData = (self._request_json("get", url, headers=self.headers) or {}).get('data')
+            if not isinstance(tokenData, dict):
+                continue
             try:
-                tokenData = self.session.get(url, headers=self.headers).json()['data']
-                profitUsd = f"${tokenData.get('total_profit', '?'):,.2f}"
-                profitPercent = f"{tokenData.get('realized_profit_pnl', '?'):,.2f}%"
+                profitUsd = f"${float(tokenData.get('total_profit', 0)):,.2f}"
+                profitPercent = f"{float(tokenData.get('realized_profit_pnl', 0)):,.2f}%"
                 return profitUsd, profitPercent
-            except Exception as e:
-                print(f"Attempt failed for wallet {walletAddress}: {e}")
+            except (TypeError, ValueError):
+                return "N/A", "N/A"
         return None, None
 
     def getLastBuy(self, walletAddress: str):
         url = f"https://gmgn.mobi/api/v1/wallet_activity/sol?type=buy&wallet={walletAddress}&limit=10&cost=10"
         for _ in range(3):
             self.randomiseRequest()
-            try:
-                activities = self.session.get(url, headers=self.headers).json()['data']['activities']
-                buys = [act for act in activities if act.get("event_type") == "buy"]
-                if not buys:
-                    print(f"No buy events found for {walletAddress}")
-                    continue
-                lastToken = max(buys, key=lambda x: x['timestamp'])['token']['address']
-                tokenBuys = [act for act in buys if act['token']['address'] == lastToken]
-                firstTokenBuy = min(tokenBuys, key=lambda x: x['timestamp'])
-                return firstTokenBuy['tx_hash'], firstTokenBuy['token']['address']
-            except Exception as e:
-                print(f"Attempt failed for wallet {walletAddress}: {e}")
+            data = self._request_json("get", url, headers=self.headers) or {}
+            activities = data.get('data', {}).get('activities', [])
+            buys = [act for act in activities if act.get("event_type") == "buy" and act.get('token', {}).get('address')]
+            if not buys:
+                continue
+            lastToken = max(buys, key=lambda x: x.get('timestamp', 0))['token']['address']
+            tokenBuys = [act for act in buys if act['token']['address'] == lastToken]
+            firstTokenBuy = min(tokenBuys, key=lambda x: x.get('timestamp', 0))
+            return firstTokenBuy.get('tx_hash'), firstTokenBuy['token']['address']
         return None, None
 
     def getBlockHash(self, transaction: str):
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTransaction",
-            "params": [
-                transaction,
-                {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}
-            ]
-        }
-        txData = self.session.post(self.rpcUrl, json=payload).json()
-        if txData["result"]['meta']["err"] is not None or not checkTxIsBuy(txData):
+        txData = self._rpc("getTransaction", [
+            transaction,
+            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}
+        ])
+        if not txData:
+            return None, None
+        meta = txData.get("result", {}).get("meta") or {}
+        if meta.get("err") is not None or not checkTxIsBuy(txData):
             return None, txData
-        with open('tx_data.json', 'w') as f:
-            json.dump(txData, f, indent=4)
         return int(txData['result']['slot']), txData
 
-    def getPotentialCopyTraders(self, startBlock: int, walletAddress: str, contractAddress: str, blockLimit: int):
+    def getPotentialCopyTraders(self, startBlock: int, walletAddress: str, contractAddress: str, blockLimit: int, txLimit: int | None):
         mainTx = None
         potentialTraders = {}
         for currentBlock in range(startBlock, startBlock + blockLimit + 1):
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getBlock",
-                "params": [currentBlock, {"encoding": "json", "maxSupportedTransactionVersion": 0,
-                                            "transactionDetails": "full", "rewards": False}]
-            }
-            data = self.session.post(self.rpcUrl, json=payload).json()
-            transactions = data['result']['transactions']
+            data = self._rpc("getBlock", [
+                currentBlock,
+                {"encoding": "json", "maxSupportedTransactionVersion": 0, "transactionDetails": "full", "rewards": False}
+            ])
+            if not data:
+                continue
+            transactions = data.get('result', {}).get('transactions') or []
+            if txLimit and txLimit > 0:
+                transactions = transactions[:txLimit]
             if currentBlock == startBlock:
                 for tx in transactions:
-                    if walletAddress in tx['transaction']['message']['accountKeys']:
-                        postBalances = tx['meta'].get('postTokenBalances', [])
-                        if postBalances and postBalances[0].get('mint') == contractAddress:
-                            mainTx = tx['transaction']['signatures'][0]
+                    accountKeys = tx.get('transaction', {}).get('message', {}).get('accountKeys', [])
+                    if walletAddress in accountKeys:
+                        postBalances = tx.get('meta', {}).get('postTokenBalances', [])
+                        if any(balance.get('mint') == contractAddress for balance in postBalances):
+                            mainTx = tx.get('transaction', {}).get('signatures', [None])[0]
                             break
             for tx in transactions:
-                trader = tx['transaction']['message']['accountKeys'][0]
+                accountKeys = tx.get('transaction', {}).get('message', {}).get('accountKeys', [])
+                if not accountKeys:
+                    continue
+                trader = accountKeys[0]
                 if trader == walletAddress:
                     continue
-                postBalances = tx['meta'].get('postTokenBalances', [])
+                postBalances = tx.get('meta', {}).get('postTokenBalances', [])
                 if any(balance.get('mint') == contractAddress for balance in postBalances):
-                    if trader not in potentialTraders:
-                        potentialTraders[trader] = (tx['transaction']['signatures'][0], currentBlock)
-        uniqueTraders = [(w, sig, blk) for w, (sig, blk) in potentialTraders.items()]
+                    potentialTraders.setdefault(trader, (tx.get('transaction', {}).get('signatures', [None])[0], currentBlock))
+        uniqueTraders = [(w, sig, blk) for w, (sig, blk) in potentialTraders.items() if sig]
         return mainTx, startBlock, uniqueTraders
+
 
 def processTransaction(finder: CopyWalletFinder, txSignature: str, mainBlock: int, wallet: str):
     botUsed = botAccounts.get(wallet, "")
-    feePaidTo, feePaid, solBought = {}, 0, 0
     blockInfo, txData = finder.getBlockHash(txSignature)
-    if blockInfo is None:
+    if blockInfo is None or not txData:
         return None
-    for instr in txData["result"]["transaction"]["message"]["instructions"]:
+    instructions = txData.get("result", {}).get("transaction", {}).get("message", {}).get("instructions", [])
+    for instr in instructions:
         if "programId" in instr and instr["programId"] in botAccounts:
             botUsed = botAccounts[instr["programId"]]
             break
@@ -258,80 +289,43 @@ def processTransaction(finder: CopyWalletFinder, txSignature: str, mainBlock: in
         "botUsed": botUsed,
         "feePaidTo": feePaidTo,
         "feePaid": f"{feePaid:.8f}",
-        "solAmountBought": solBought
+        "solAmountBought": solBought,
     }
 
-def main():
-    with open('config.json') as f:
-        config = json.load(f)
 
-    rpcUrl = config['rpc_url']
-    walletAddress = config['walletAddress']
-    blockLimit = config['blockLimit']
-    
+def load_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing {path}. Copy config.example.json to config.json and fill in your values.")
+    with path.open() as f:
+        return json.load(f)
+
+
+def validate_config(config: dict[str, Any]) -> tuple[str, str, int, int | None]:
+    rpcUrl = str(config.get('rpc_url', '')).strip()
+    walletAddress = str(config.get('walletAddress', '')).strip()
+    blockLimit = int(config.get('blockLimit', 1))
+    txLimit = config.get('txLimit')
+    txLimit = int(txLimit) if txLimit not in (None, "") else None
+
+    if not rpcUrl or rpcUrl.endswith("api-key=xxx"):
+        raise ValueError("Set rpc_url in config.json to a real read-only Solana RPC URL.")
     if not walletAddress:
-        print("No target wallet address found")
-        sys.exit(1)
+        raise ValueError("Set walletAddress in config.json.")
+    if blockLimit < 0:
+        raise ValueError("blockLimit must be zero or greater.")
+    if txLimit is not None and txLimit <= 0:
+        raise ValueError("txLimit must be greater than zero when provided.")
+    return rpcUrl, walletAddress, blockLimit, txLimit
 
-    finder = CopyWalletFinder(rpcUrl)
-    transaction, contractAddress = finder.getLastBuy(walletAddress)
-    if not transaction or not contractAddress:
-        print("Could not retrieve main wallet transaction details")
-        sys.exit(1)
 
-    mainBlock, txData = finder.getBlockHash(transaction)
-    if mainBlock is None:
-        print("Main transaction failed or did not meet the criteria; cannot proceed.")
-        sys.exit(1)
-
-    mainSolBought = getSolAmountBought(txData)
-
-    outputData = {
-        walletAddress: {
-            "contractAddress": contractAddress,
-            "mainTransaction": transaction,
-            "mainBlock": mainBlock,
-            "potentialCopyTraders": {}
-        }
-    }
-
-    _, mainBlock, potentialTraders = finder.getPotentialCopyTraders(mainBlock, walletAddress, contractAddress, blockLimit)
-    rows = []
-    headers = ["Trader", "Signature", "Block Delay", "Bot Used", "Tx Processor/Fee Wallet", "Fee Paid", "SOL Bought", "Profit/PNL"]
-    rows.append(headers)
-
-    for trader, txSig, contestantBlock in potentialTraders:
-        result = processTransaction(finder, txSig, mainBlock, trader)
-        if not result:
-            continue
-
-        profitUsd, profitPercent = finder.getPNL(contractAddress, trader)
-        if profitUsd and profitPercent:
-            profitPNL = f"{profitUsd} ({profitPercent})"
-        else:
-            profitPNL = "N/A"
-
-        result["profitPNL"] = profitPNL
-
-        outputData[walletAddress]["potentialCopyTraders"][trader] = result
-        feeWalletsStr = ", ".join(result["feePaidTo"].keys())
-        rows.append([
-            trader,
-            shorten(txSig),
-            str(result["blockDelay"]),
-            result["botUsed"],
-            feeWalletsStr,
-            f"{result['feePaid']} SOL",
-            f"{result['solAmountBought']:.8f} SOL",
-            profitPNL
-        ])
-
-    filename = f"results/copytraders_{shorten(walletAddress)}_{shorten(contractAddress)}.json"
-    with open(filename, "w") as outfile:
+def write_outputs(walletAddress: str, contractAddress: str, outputData: dict[str, Any]):
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    filename = RESULTS_DIR / f"copytraders_{shorten(walletAddress)}_{shorten(contractAddress)}.json"
+    with filename.open("w") as outfile:
         json.dump(outputData, outfile, indent=4)
 
-    csvFilename = f"results/copytraders_{shorten(walletAddress)}_{shorten(contractAddress)}.csv"
-    with open(csvFilename, "w", newline="") as csvfile:
+    csvFilename = RESULTS_DIR / f"copytraders_{shorten(walletAddress)}_{shorten(contractAddress)}.csv"
+    with csvFilename.open("w", newline="") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(["WalletAddress", "Trader", "TxSignature", "BlockDelay", "BotUsed", "FeePaidTo", "FeePaid", "SOL Bought", "Profit/PNL"])
         for trader, data in outputData[walletAddress]["potentialCopyTraders"].items():
@@ -344,14 +338,80 @@ def main():
                 json.dumps(data["feePaidTo"]),
                 data["feePaid"],
                 data["solAmountBought"],
-                data["profitPNL"]
+                data["profitPNL"],
             ])
+    return filename, csvFilename
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Find wallets that bought the same Solana token shortly after a target wallet.")
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="Path to config JSON file")
+    args = parser.parse_args()
+
+    try:
+        config = load_config(args.config)
+        rpcUrl, walletAddress, blockLimit, txLimit = validate_config(config)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    finder = CopyWalletFinder(rpcUrl)
+    transaction, contractAddress = finder.getLastBuy(walletAddress)
+    if not transaction or not contractAddress:
+        print("Could not retrieve main wallet transaction details")
+        sys.exit(1)
+
+    mainBlock, txData = finder.getBlockHash(transaction)
+    if mainBlock is None or not txData:
+        print("Main transaction failed or did not meet the criteria; cannot proceed.")
+        sys.exit(1)
+
+    mainSolBought = getSolAmountBought(txData)
+
+    outputData = {
+        walletAddress: {
+            "contractAddress": contractAddress,
+            "mainTransaction": transaction,
+            "mainBlock": mainBlock,
+            "potentialCopyTraders": {},
+        }
+    }
+
+    _, mainBlock, potentialTraders = finder.getPotentialCopyTraders(mainBlock, walletAddress, contractAddress, blockLimit, txLimit)
+    rows = []
+    headers = ["Trader", "Signature", "Block Delay", "Bot Used", "Tx Processor/Fee Wallet", "Fee Paid", "SOL Bought", "Profit/PNL"]
+    rows.append(headers)
+
+    for trader, txSig, contestantBlock in potentialTraders:
+        result = processTransaction(finder, txSig, mainBlock, trader)
+        if not result:
+            continue
+
+        profitUsd, profitPercent = finder.getPNL(contractAddress, trader)
+        profitPNL = f"{profitUsd} ({profitPercent})" if profitUsd and profitPercent else "N/A"
+        result["profitPNL"] = profitPNL
+
+        outputData[walletAddress]["potentialCopyTraders"][trader] = result
+        feeWalletsStr = ", ".join(result["feePaidTo"].keys())
+        rows.append([
+            trader,
+            shorten(txSig),
+            str(result["blockDelay"]),
+            result["botUsed"],
+            feeWalletsStr,
+            f"{result['feePaid']} SOL",
+            f"{result['solAmountBought']:.8f} SOL",
+            profitPNL,
+        ])
+
+    filename, csvFilename = write_outputs(walletAddress, contractAddress, outputData)
 
     colWidths = [max(len(str(row[i])) for row in rows) for i in range(len(headers))]
     separator = "+" + "+".join("-" * (w + 2) for w in colWidths) + "+"
+
     def formatRow(row):
         return "| " + " | ".join(f"{str(cell):<{colWidths[i]}}" for i, cell in enumerate(row)) + " |"
-    
+
     print(f"Target Wallet: {walletAddress} - {shorten(transaction)} - Block: {mainBlock} - Bought: {mainSolBought:.8f} SOL\n")
     print("Potential copy traders:\n")
     print(separator)
@@ -361,6 +421,7 @@ def main():
         print(formatRow(row))
     print(separator)
     print(f"\nCheck {filename} and {csvFilename} for more info")
+
 
 if __name__ == "__main__":
     main()
