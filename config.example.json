@@ -1,0 +1,6 @@
+{
+  "rpc_url": "https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY",
+  "walletAddress": "",
+  "blockLimit": 1,
+  "txLimit": 100
+}

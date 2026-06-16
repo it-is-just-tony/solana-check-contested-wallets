@@ -1,3 +1,7 @@
-/results
+.venv/
+__pycache__/
+*.py[cod]
+
 config.json
-*.json
+/results/*
+!/results/placeholder.txt
